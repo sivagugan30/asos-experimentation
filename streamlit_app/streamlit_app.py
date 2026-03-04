@@ -6,8 +6,10 @@ Interactive Streamlit app for exploring the ASOS Digital Experiments Dataset.
 import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 # ---------------------------------------------------------------------------
@@ -59,6 +61,7 @@ page = st.sidebar.radio(
         "Background",
         "Meet the experiments",
         "Stats that stick",
+        "Peeking problem",
         "Notebook throwbacks",
     ],
 )
@@ -315,6 +318,237 @@ elif page == "Stats that stick":
         ].sort_values("p_value"),
         width="stretch",
     )
+
+# ===================================================================
+# PAGE: Sequential Testing / Peeking Problem
+# ===================================================================
+elif page == "Peeking problem":
+    st.title("The Peeking Problem")
+    st.markdown(
+        "When analysts check experiment results before the planned end-date, "
+        "conventional p-values lose their meaning. Each extra look inflates the "
+        "false-positive rate. This page replays all 78 experiments at every recorded "
+        "time snapshot and compares **naive** peeking against two alpha-spending corrections."
+    )
+
+    # --- compute sequential stats (cached) ---
+    @st.cache_data
+    def compute_sequential(raw_df):
+        ALPHA = 0.05
+        Z_CRIT = 1.959964
+
+        sdf = raw_df.copy()
+        sdf["std_error"] = np.sqrt(
+            sdf["variance_c"] / sdf["count_c"] + sdf["variance_t"] / sdf["count_t"]
+        )
+        sdf["lift"] = sdf["mean_t"] - sdf["mean_c"]
+        sdf["z_score"] = sdf["lift"] / sdf["std_error"]
+        sdf["p_value"] = sdf["z_score"].apply(z_to_p)
+        pooled_var = (
+            ((sdf["count_c"] - 1) * sdf["variance_c"] + (sdf["count_t"] - 1) * sdf["variance_t"])
+            / (sdf["count_c"] + sdf["count_t"] - 2)
+        )
+        sdf["std_lift"] = sdf["lift"] / np.sqrt(pooled_var).replace(0, np.nan)
+        sdf = sdf.replace([np.inf, -np.inf], np.nan).dropna(subset=["std_error", "z_score"])
+
+        sdf = sdf.sort_values(["experiment_id", "metric_id", "variant_id", "time_since_start"])
+        gcols = ["experiment_id", "metric_id", "variant_id"]
+        sdf["peek_num"] = sdf.groupby(gcols).cumcount() + 1
+        sdf["total_peeks"] = sdf.groupby(gcols)["peek_num"].transform("max")
+        sdf["info_fraction"] = sdf["peek_num"] / sdf["total_peeks"]
+
+        sdf["pocock_threshold"] = ALPHA / sdf["total_peeks"]
+        obf_z = Z_CRIT / np.sqrt(sdf["info_fraction"])
+        sdf["obf_threshold"] = obf_z.apply(z_to_p)
+
+        sdf["naive_sig"] = sdf["p_value"] < ALPHA
+        sdf["pocock_sig"] = sdf["p_value"] < sdf["pocock_threshold"]
+        sdf["obf_sig"] = sdf["p_value"] < sdf["obf_threshold"]
+
+        early = sdf[sdf["peek_num"] < sdf["total_peeks"]].copy()
+        early_flags = (
+            early.groupby(gcols)
+            .agg(naive_ever=("naive_sig", "any"), pocock_ever=("pocock_sig", "any"), obf_ever=("obf_sig", "any"))
+            .reset_index()
+        )
+
+        final_look = (
+            sdf[sdf["peek_num"] == sdf["total_peeks"]][gcols + ["p_value"]]
+            .rename(columns={"p_value": "final_p"})
+        )
+        final_look["final_sig"] = final_look["final_p"] < ALPHA
+        alarm_acc = early_flags.merge(final_look, on=gcols)
+
+        def classify(row, rule_col):
+            if row[rule_col] and row["final_sig"]:
+                return "True Positive"
+            if row[rule_col] and not row["final_sig"]:
+                return "False Positive"
+            if not row[rule_col] and row["final_sig"]:
+                return "Missed"
+            return "True Negative"
+
+        for rule, col in [("naive", "naive_ever"), ("pocock", "pocock_ever"), ("obf", "obf_ever")]:
+            alarm_acc[f"{rule}_outcome"] = alarm_acc.apply(lambda r, c=col: classify(r, c), axis=1)
+
+        return sdf, early_flags, alarm_acc
+
+    seq_df, early_flags, alarm_acc = compute_sequential(df)
+
+    # --- top-level metrics ---
+    gcols = ["experiment_id", "metric_id", "variant_id"]
+    n_exp = seq_df["experiment_id"].nunique()
+    n_series = len(early_flags)
+    n_rows = len(seq_df)
+    naive_early = int(early_flags["naive_ever"].sum())
+    pocock_early = int(early_flags["pocock_ever"].sum())
+    obf_early = int(early_flags["obf_ever"].sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Experiments", n_exp)
+    c2.metric("Metric series", n_series)
+    c3.metric("Total peeks", f"{n_rows:,}")
+    c4.metric("Naive early flags", f"{naive_early} ({100*naive_early/n_series:.0f}%)")
+
+    # --- rules explanation ---
+    st.markdown(
+        """
+        | Rule | How it works |
+        |---|---|
+        | **Naive** | Flag significant whenever p < 0.05 at any peek |
+        | **Pocock** | Constant stricter threshold at every peek (alpha / K) |
+        | **O'Brien–Fleming** | Very strict early, relaxes toward 0.05 at the final look |
+        """
+    )
+
+    # --- early alarm comparison ---
+    st.subheader("Early stopping signals: naive vs. corrected")
+    alarm_fig = go.Figure()
+    rules = ["Naive", "Pocock", "O'Brien–Fleming"]
+    counts = [naive_early, pocock_early, obf_early]
+    colors = ["#e45756", "#f58518", "#4c78a8"]
+    alarm_fig.add_trace(go.Bar(
+        y=rules, x=counts, orientation="h",
+        marker_color=colors, text=counts, textposition="outside",
+    ))
+    alarm_fig.update_layout(
+        template="plotly_dark",
+        title=f"Series flagged significant before final look (out of {n_series})",
+        xaxis_title="Number of series",
+        yaxis=dict(autorange="reversed"),
+        showlegend=False,
+        height=300,
+    )
+    st.plotly_chart(alarm_fig, use_container_width=True)
+
+    # --- alarm accuracy confusion ---
+    st.subheader("Were the early alarms right?")
+    st.markdown(
+        "We use the **final-peek p-value** as ground truth. An early alarm is a "
+        "**True Positive** if the experiment is also significant at the end, and a "
+        "**False Positive** if it isn't."
+    )
+
+    outcome_labels = ["True Positive", "False Positive", "Missed", "True Negative"]
+    acc_rows = []
+    for rule_name, col in [("Naive", "naive_outcome"), ("Pocock", "pocock_outcome"), ("OBF", "obf_outcome")]:
+        vc = alarm_acc[col].value_counts()
+        tp = vc.get("True Positive", 0)
+        fp = vc.get("False Positive", 0)
+        fn = vc.get("Missed", 0)
+        tn = vc.get("True Negative", 0)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        acc_rows.append({
+            "Rule": rule_name,
+            "True Positive": tp, "False Positive": fp,
+            "Missed (FN)": fn, "True Negative": tn,
+            "Precision": f"{precision:.1%}", "Recall": f"{recall:.1%}",
+        })
+    acc_table = pd.DataFrame(acc_rows).set_index("Rule")
+    st.dataframe(acc_table, use_container_width=True)
+
+    outcome_colors = {"True Positive": "#4c78a8", "False Positive": "#e45756",
+                      "Missed": "#f58518", "True Negative": "#72b7b2"}
+    conf_fig = go.Figure()
+    for label in outcome_labels:
+        vals = [acc_table.loc[r, label] if label != "Missed" else acc_table.loc[r, "Missed (FN)"]
+                for r in ["Naive", "Pocock", "OBF"]]
+        conf_fig.add_trace(go.Bar(
+            name=label, x=["Naive", "Pocock", "OBF"], y=vals,
+            marker_color=outcome_colors[label], text=vals, textposition="auto",
+        ))
+    conf_fig.update_layout(
+        barmode="group", template="plotly_dark",
+        title="Alarm accuracy: confusion matrix by rule",
+        yaxis_title="Number of series", height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(conf_fig, use_container_width=True)
+
+    # --- interactive monitoring chart ---
+    st.subheader("Experiment monitoring chart")
+    st.markdown("Pick an experiment to see its running |z-score| vs. the stopping boundaries.")
+    exp_list = sorted(seq_df["experiment_id"].unique())
+    sel_exp = st.selectbox("Experiment", exp_list, key="peek_exp")
+    sel_sub = seq_df[(seq_df["experiment_id"] == sel_exp) & (seq_df["metric_id"] == 1)]
+    if sel_sub.empty:
+        sel_sub = seq_df[seq_df["experiment_id"] == sel_exp]
+    sel_sub = sel_sub.sort_values("time_since_start")
+
+    ALPHA = 0.05
+    Z_CRIT = 1.959964
+    K = sel_sub["total_peeks"].iloc[0]
+    from scipy.stats import norm
+    pocock_z = norm.ppf(1 - (ALPHA / K) / 2)
+    obf_z_vals = Z_CRIT / np.sqrt(sel_sub["info_fraction"])
+
+    mon_fig = go.Figure()
+    mon_fig.add_trace(go.Scatter(
+        x=sel_sub["info_fraction"], y=sel_sub["z_score"].abs(),
+        mode="lines", name="|z-score|", line=dict(color="#4c78a8", width=2),
+    ))
+    mon_fig.add_hline(y=Z_CRIT, line_dash="dash", line_color="gray",
+                      annotation_text="Naive z=1.96", annotation_font_color="white")
+    mon_fig.add_hline(y=pocock_z, line_dash="dashdot", line_color="#f58518",
+                      annotation_text=f"Pocock z={pocock_z:.2f}", annotation_font_color="#f58518")
+    mon_fig.add_trace(go.Scatter(
+        x=sel_sub["info_fraction"], y=obf_z_vals,
+        mode="lines", name="OBF boundary", line=dict(color="#e45756", width=2, dash="dot"),
+    ))
+    mon_fig.update_layout(
+        template="plotly_dark",
+        title=f"Experiment {sel_exp} — sequential monitoring (K={K} peeks)",
+        xaxis_title="Information fraction (0 = start, 1 = end)",
+        yaxis_title="|z-score|",
+        yaxis=dict(rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=450,
+    )
+    st.plotly_chart(mon_fig, use_container_width=True)
+
+    # --- per-experiment table ---
+    st.subheader("Per-experiment alarm breakdown")
+    per_exp = (
+        alarm_acc.groupby("experiment_id")
+        .agg(
+            series=("final_sig", "count"),
+            final_sig=("final_sig", "sum"),
+            naive_alarms=("naive_ever", "sum"),
+            naive_TP=("naive_outcome", lambda s: (s == "True Positive").sum()),
+            naive_FP=("naive_outcome", lambda s: (s == "False Positive").sum()),
+            pocock_alarms=("pocock_ever", "sum"),
+            pocock_TP=("pocock_outcome", lambda s: (s == "True Positive").sum()),
+            pocock_FP=("pocock_outcome", lambda s: (s == "False Positive").sum()),
+            obf_alarms=("obf_ever", "sum"),
+            obf_TP=("obf_outcome", lambda s: (s == "True Positive").sum()),
+            obf_FP=("obf_outcome", lambda s: (s == "False Positive").sum()),
+        )
+        .reset_index()
+        .sort_values("naive_FP", ascending=False)
+    )
+    per_exp = per_exp.astype({c: int for c in per_exp.columns if c != "experiment_id"})
+    st.dataframe(per_exp, use_container_width=True)
 
 # ===================================================================
 # PAGE: Saved Notebook Plots
