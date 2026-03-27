@@ -167,7 +167,7 @@ elif page == "Meet the experiments":
         .assign(
             phase=lambda d: d["phase"].map({"mean_c": "Control", "mean_t": "Treatment"}),
             series_label=lambda d: d.apply(
-                lambda row: f"Var {row['variant_id']} {row['phase']}", axis=1
+                lambda row: f"Variant {row['variant_id']} — {row['phase']}", axis=1
             ),
         )
     )
@@ -196,8 +196,14 @@ elif page == "Meet the experiments":
     st.subheader("Final snapshot")
     final = exp_metric.groupby("variant_id").last().reset_index()
     final["lift"] = final["mean_t"] - final["mean_c"]
+    final["std_error"] = np.sqrt(
+        final["variance_c"] / final["count_c"] + final["variance_t"] / final["count_t"]
+    )
+    final["z_score"] = final["lift"] / final["std_error"]
+    final["p_value"] = final["z_score"].apply(z_to_p)
+    final["significant"] = final["p_value"].apply(lambda p: "Yes" if p < 0.05 else "No")
     st.dataframe(
-        final[["variant_id", "count_c", "count_t", "mean_c", "mean_t", "lift"]].rename(
+        final[["variant_id", "count_c", "count_t", "mean_c", "mean_t", "lift", "p_value", "significant"]].rename(
             columns={
                 "variant_id": "Variant",
                 "count_c": "N control",
@@ -205,6 +211,8 @@ elif page == "Meet the experiments":
                 "mean_c": "Mean control",
                 "mean_t": "Mean treatment",
                 "lift": "Lift (T - C)",
+                "p_value": "P-value",
+                "significant": "Significant (p < 0.05)",
             }
         ),
         width="stretch",
@@ -420,6 +428,140 @@ elif page == "Peeking problem":
         | **O'Brien–Fleming** | Very strict early, relaxes toward 0.05 at the final look |
         """
     )
+
+    # --- worked example: user picks an experiment ---
+    st.subheader("How each rule works — pick an experiment")
+    from scipy.stats import norm as _norm
+
+    ex_exp_list = sorted(seq_df["experiment_id"].unique())
+    example_exp = st.selectbox("Experiment", ex_exp_list, key="example_exp")
+
+    ex_metrics = sorted(seq_df[seq_df["experiment_id"] == example_exp]["metric_id"].unique())
+    example_metric = st.selectbox(
+        "Metric", ex_metrics,
+        format_func=lambda m: METRIC_LABELS.get(m, f"Metric {m}"),
+        key="example_metric",
+    )
+
+    ex_sub = seq_df[
+        (seq_df["experiment_id"] == example_exp) & (seq_df["metric_id"] == example_metric)
+    ].sort_values("time_since_start").copy()
+    ex_K = int(ex_sub["total_peeks"].iloc[0])
+
+    final_row = ex_sub[ex_sub["peek_num"] == ex_sub["total_peeks"]].iloc[0]
+    final_p = final_row["p_value"]
+    final_sig = final_p < 0.05
+
+    fp1, fp2, fp3 = st.columns(3)
+    fp1.metric("Final p-value", f"{final_p:.4f}")
+    fp2.metric("Significant at end?", "Yes" if final_sig else "No")
+    fp3.metric("Total peeks", ex_K)
+
+    pocock_z_ex = _norm.ppf(1 - (0.05 / ex_K) / 2)
+    obf_early_z = 1.96 / math.sqrt(0.1)
+    obf_mid_z = 1.96 / math.sqrt(0.5)
+
+    with st.expander("How do the three rules work?"):
+        st.markdown(
+            "At each checkpoint we compute a z-score. If |z| is **above** the boundary, "
+            "that rule calls the experiment significant at that peek. The three rules "
+            "only differ in where they set the bar."
+        )
+
+        st.markdown("---")
+        st.markdown("**1. Naive**")
+        st.latex(r"\text{Reject if } |z| > z_{\alpha/2} = 1.96 \text{ at any peek}")
+        st.markdown(
+            f"Same threshold every time. With **{ex_K} peeks** you get {ex_K} chances "
+            "to cross it, so the real false-positive rate balloons well above 5%."
+        )
+
+        st.markdown("---")
+        st.markdown("**2. Pocock**")
+        st.latex(r"\text{Threshold per peek} = \frac{\alpha}{K}")
+        st.latex(
+            rf"\frac{{0.05}}{{{ex_K}}} = {0.05/ex_K:.5f}"
+            rf"\;\;\Rightarrow\;\; |z| > {pocock_z_ex:.2f}"
+        )
+        st.markdown(
+            "Every peek uses the same stricter bar. Very conservative — "
+            "hard to cross at any point in the experiment."
+        )
+
+        st.markdown("---")
+        st.markdown("**3. O'Brien–Fleming**")
+        st.latex(r"z_{\text{boundary}}(k) = \frac{z_{\alpha/2}}{\sqrt{k / K}}")
+        st.markdown(f"For this experiment (K = {ex_K}):")
+        obf_examples = pd.DataFrame({
+            "Peek (k)": [
+                max(1, round(0.1 * ex_K)),
+                max(1, round(0.25 * ex_K)),
+                max(1, round(0.5 * ex_K)),
+                max(1, round(0.75 * ex_K)),
+                ex_K,
+            ],
+        })
+        obf_examples["k / K"] = obf_examples["Peek (k)"] / ex_K
+        obf_examples["Boundary |z|"] = 1.96 / np.sqrt(obf_examples["k / K"])
+        obf_examples["k / K"] = obf_examples["k / K"].map("{:.2f}".format)
+        obf_examples["Boundary |z|"] = obf_examples["Boundary |z|"].map("{:.2f}".format)
+        st.dataframe(obf_examples, use_container_width=True, hide_index=True)
+        st.markdown(
+            "The bar starts extremely high (almost impossible to cross early) and "
+            "shrinks toward 1.96 at the final look. Strong effects can stop early; "
+            "weak ones are protected from false calls."
+        )
+
+    Z_CRIT_EX = 1.959964
+    obf_z_ex = Z_CRIT_EX / np.sqrt(ex_sub["info_fraction"])
+
+    ex_fig = go.Figure()
+    ex_fig.add_trace(go.Scatter(
+        x=ex_sub["info_fraction"], y=ex_sub["z_score"].abs(),
+        mode="lines", name="|z-score|", line=dict(color="#4c78a8", width=2),
+    ))
+    ex_fig.add_hline(y=Z_CRIT_EX, line_dash="dash", line_color="gray",
+                     annotation_text="Naive (1.96)", annotation_font_color="white")
+    ex_fig.add_hline(y=pocock_z_ex, line_dash="dashdot", line_color="#f58518",
+                     annotation_text=f"Pocock ({pocock_z_ex:.2f})", annotation_font_color="#f58518")
+    ex_fig.add_trace(go.Scatter(
+        x=ex_sub["info_fraction"], y=obf_z_ex,
+        mode="lines", name="OBF boundary", line=dict(color="#e45756", width=2, dash="dot"),
+    ))
+    ex_fig.update_layout(
+        template="plotly_dark",
+        title=f"Experiment {example_exp} · {METRIC_LABELS.get(example_metric, f'Metric {example_metric}')} — z-score vs. boundaries",
+        xaxis_title="Information fraction (0 = start, 1 = end)",
+        yaxis_title="|z-score|",
+        yaxis=dict(rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=420,
+    )
+    st.plotly_chart(ex_fig, use_container_width=True)
+
+    naive_crosses = int(ex_sub["naive_sig"].sum())
+    pocock_crosses = int(ex_sub["pocock_sig"].sum())
+    obf_crosses = int(ex_sub["obf_sig"].sum())
+
+    cross_table = pd.DataFrame({
+        "Rule": ["Naive (p < 0.05)", "Pocock", "O'Brien–Fleming"],
+        "Boundary": [f"|z| > {Z_CRIT_EX:.2f}", f"|z| > {pocock_z_ex:.2f}", "Varies (see curve)"],
+        "Peeks crossed": [naive_crosses, pocock_crosses, obf_crosses],
+        "Out of": [ex_K, ex_K, ex_K],
+        "% crossed": [f"{100*naive_crosses/ex_K:.1f}%", f"{100*pocock_crosses/ex_K:.1f}%", f"{100*obf_crosses/ex_K:.1f}%"],
+    })
+    st.dataframe(cross_table, use_container_width=True, hide_index=True)
+
+    if final_sig:
+        st.success(
+            f"This experiment **is significant** at the final look (p = {final_p:.4f}). "
+            f"Naive flagged it at {naive_crosses}/{ex_K} peeks, Pocock at {pocock_crosses}, OBF at {obf_crosses}."
+        )
+    else:
+        st.warning(
+            f"This experiment **is NOT significant** at the final look (p = {final_p:.4f}). "
+            f"Any early crossing was a false alarm — naive produced {naive_crosses}, Pocock {pocock_crosses}, OBF {obf_crosses}."
+        )
 
     # --- early alarm comparison ---
     st.subheader("Early stopping signals: naive vs. corrected")
